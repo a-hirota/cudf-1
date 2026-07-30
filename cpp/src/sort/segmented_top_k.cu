@@ -69,30 +69,29 @@ CUDF_KERNEL void resolve_segment_indices(device_span<size_type const> d_offsets,
     d_segment_sizes[segment_index] = cuda::std::min(k, segment_size);
   }
 }
-}  // namespace
 
-std::unique_ptr<column> segmented_top_k_order(column_view const& col,
-                                              column_view const& segment_offsets,
-                                              size_type k,
-                                              order topk_order,
-                                              rmm::cuda_stream_view stream,
-                                              rmm::device_async_resource_ref mr)
+/**
+ * @brief Computes the top k indices per segment by fully sorting each segment
+ *
+ * Sorts every segment and then drops the indices beyond the first k of each one.
+ * This is the general fallback: it supports all types, nulls, and any segment size.
+ *
+ * @param col Column to compute the top k indices for
+ * @param segment_offsets Offsets for each segment
+ * @param k Number of indices to keep per segment
+ * @param topk_order Whether the top k are the largest or the smallest values
+ * @param stream CUDA stream used for device memory operations and kernel launches
+ * @param mr Device memory resource used to allocate the returned column's device memory
+ * @return Lists column of the top k indices for each segment
+ */
+std::unique_ptr<column> sort_based_segmented_top_k_order(column_view const& col,
+                                                        column_view const& segment_offsets,
+                                                        size_type k,
+                                                        order topk_order,
+                                                        rmm::cuda_stream_view stream,
+                                                        rmm::device_async_resource_ref mr)
 {
-  CUDF_EXPECTS(k >= 0, "k must be greater than or equal to 0", std::invalid_argument);
-
   auto const size_data_type = data_type{type_to_id<size_type>()};
-  if (k == 0 || col.is_empty()) { return cudf::make_empty_lists_column(size_data_type); }
-
-  CUDF_EXPECTS(segment_offsets.size() > 0,
-               "segment_offsets must have at least one element",
-               std::invalid_argument);
-
-  CUDF_EXPECTS(segment_offsets.type() == size_data_type,
-               "segment_offsets must be of type INT32",
-               cudf::data_type_error);
-  CUDF_EXPECTS(segment_offsets.null_count() == 0,
-               "segment_offsets must not have nulls",
-               std::invalid_argument);
 
   auto const nulls   = topk_order == order::ASCENDING ? null_order::AFTER : null_order::BEFORE;
   auto const temp_mr = cudf::get_current_device_resource_ref();
@@ -125,6 +124,33 @@ std::unique_ptr<column> segmented_top_k_order(column_view const& col,
   auto const num_rows = static_cast<size_type>(offsets->size() - 1);
   return make_lists_column(
     num_rows, std::move(offsets), std::move(result), 0, rmm::device_buffer{});
+}
+}  // namespace
+
+std::unique_ptr<column> segmented_top_k_order(column_view const& col,
+                                              column_view const& segment_offsets,
+                                              size_type k,
+                                              order topk_order,
+                                              rmm::cuda_stream_view stream,
+                                              rmm::device_async_resource_ref mr)
+{
+  CUDF_EXPECTS(k >= 0, "k must be greater than or equal to 0", std::invalid_argument);
+
+  auto const size_data_type = data_type{type_to_id<size_type>()};
+  if (k == 0 || col.is_empty()) { return cudf::make_empty_lists_column(size_data_type); }
+
+  CUDF_EXPECTS(segment_offsets.size() > 0,
+               "segment_offsets must have at least one element",
+               std::invalid_argument);
+
+  CUDF_EXPECTS(segment_offsets.type() == size_data_type,
+               "segment_offsets must be of type INT32",
+               cudf::data_type_error);
+  CUDF_EXPECTS(segment_offsets.null_count() == 0,
+               "segment_offsets must not have nulls",
+               std::invalid_argument);
+
+  return sort_based_segmented_top_k_order(col, segment_offsets, k, topk_order, stream, mr);
 }
 
 std::unique_ptr<column> segmented_top_k(column_view const& col,
