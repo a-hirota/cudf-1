@@ -471,3 +471,137 @@ TEST_F(TopK, TopKSegmentedEmptyMultiBlock)
   result = cudf::segmented_top_k_order(input, offsets, 2);
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected_order, result->view());
 }
+
+// ---------------------------------------------------------------------------------------
+// CUB fast path
+//
+// segmented_top_k_order selects with cub::DeviceBatchedTopK instead of sorting when the
+// column has no nulls and is fixed-width non-floating-point, and every segment both holds
+// at least k rows and fits the internal segment-size bound. The tests below pin down both
+// sides of that decision: inputs the fast path takes, and inputs it must hand to the
+// sort-based fallback while producing exactly the same answer.
+// ---------------------------------------------------------------------------------------
+
+// Integral and chrono types take the CUB path here while floating point falls back, so the
+// shared expectation also checks the two paths agree.
+TYPED_TEST(TopKTypes, TopKSegmentedFastPath)
+{
+  using T    = TypeParam;
+  using LCW  = cudf::test::lists_column_wrapper<T, int32_t>;
+  using LCWO = cudf::test::lists_column_wrapper<cudf::size_type>;
+
+  auto itr     = cuda::counting_iterator<int32_t>{0};
+  auto input   = cudf::test::fixed_width_column_wrapper<T, int32_t>(itr, itr + 40);
+  auto offsets = cudf::test::fixed_width_column_wrapper<int32_t>({0, 10, 20, 30, 40});
+
+  LCW expected({LCW{9, 8, 7}, LCW{19, 18, 17}, LCW{29, 28, 27}, LCW{39, 38, 37}});
+  auto result = cudf::segmented_top_k(input, offsets, 3);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected, result->view());
+
+  LCWO expected_order({LCWO{9, 8, 7}, LCWO{19, 18, 17}, LCWO{29, 28, 27}, LCWO{39, 38, 37}});
+  result = cudf::segmented_top_k_order(input, offsets, 3);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected_order, result->view());
+}
+
+// k equal to the segment size is the smallest input the fast path may accept: one row
+// fewer and it must fall back, since CUB emits exactly k indices per segment.
+TEST_F(TopK, TopKSegmentedFastPathKEqualsSegmentSize)
+{
+  using LCW  = cudf::test::lists_column_wrapper<int32_t>;
+  using LCWO = cudf::test::lists_column_wrapper<cudf::size_type>;
+
+  auto itr     = cuda::counting_iterator<int32_t>{0};
+  auto input   = cudf::test::fixed_width_column_wrapper<int32_t>(itr, itr + 8);
+  auto offsets = cudf::test::fixed_width_column_wrapper<int32_t>({0, 4, 8});
+
+  LCW expected({LCW{3, 2, 1, 0}, LCW{7, 6, 5, 4}});
+  auto result = cudf::segmented_top_k(input, offsets, 4);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected, result->view());
+
+  LCWO expected_order({LCWO{3, 2, 1, 0}, LCWO{7, 6, 5, 4}});
+  result = cudf::segmented_top_k_order(input, offsets, 4);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected_order, result->view());
+}
+
+// A segment holding fewer than k rows must send the whole call down the sort path, which
+// returns min(k, segment_size) rows -- a result the fixed-k CUB path cannot express.
+TEST_F(TopK, TopKSegmentedFastPathRejectsSegmentSmallerThanK)
+{
+  using LCW  = cudf::test::lists_column_wrapper<int32_t>;
+  using LCWO = cudf::test::lists_column_wrapper<cudf::size_type>;
+
+  auto itr     = cuda::counting_iterator<int32_t>{0};
+  auto input   = cudf::test::fixed_width_column_wrapper<int32_t>(itr, itr + 7);
+  auto offsets = cudf::test::fixed_width_column_wrapper<int32_t>({0, 2, 7});
+
+  LCW expected({LCW{1, 0}, LCW{6, 5, 4}});
+  auto result = cudf::segmented_top_k(input, offsets, 3);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected, result->view());
+
+  LCWO expected_order({LCWO{1, 0}, LCWO{6, 5, 4}});
+  result = cudf::segmented_top_k_order(input, offsets, 3);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected_order, result->view());
+}
+
+// Straddles the internal segment-size bound: 1024 rows is the largest segment the fast
+// path currently accepts and 1025 forces the fallback. Both must give the same answer, so
+// this stays correct if the bound is later raised (CUB compiles up to 2048 today).
+TEST_F(TopK, TopKSegmentedFastPathSegmentSizeBound)
+{
+  using LCW  = cudf::test::lists_column_wrapper<int32_t>;
+  using LCWO = cudf::test::lists_column_wrapper<cudf::size_type>;
+
+  auto itr = cuda::counting_iterator<int32_t>{0};
+  {
+    auto input   = cudf::test::fixed_width_column_wrapper<int32_t>(itr, itr + 1024);
+    auto offsets = cudf::test::fixed_width_column_wrapper<int32_t>({0, 1024});
+    LCW expected({LCW{1023, 1022}});
+    auto result = cudf::segmented_top_k(input, offsets, 2);
+    CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected, result->view());
+    LCWO expected_order({LCWO{1023, 1022}});
+    result = cudf::segmented_top_k_order(input, offsets, 2);
+    CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected_order, result->view());
+  }
+  {
+    auto input   = cudf::test::fixed_width_column_wrapper<int32_t>(itr, itr + 1025);
+    auto offsets = cudf::test::fixed_width_column_wrapper<int32_t>({0, 1025});
+    LCW expected({LCW{1024, 1023}});
+    auto result = cudf::segmented_top_k(input, offsets, 2);
+    CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected, result->view());
+    LCWO expected_order({LCWO{1024, 1023}});
+    result = cudf::segmented_top_k_order(input, offsets, 2);
+    CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected_order, result->view());
+  }
+}
+
+// Negative values and both sort orders.
+TEST_F(TopK, TopKSegmentedFastPathNegativeValues)
+{
+  using LCW = cudf::test::lists_column_wrapper<int32_t>;
+
+  auto input   = cudf::test::fixed_width_column_wrapper<int32_t>({-5, 3, -1, 7, 2, -8, 0, 4});
+  auto offsets = cudf::test::fixed_width_column_wrapper<int32_t>({0, 4, 8});
+
+  LCW expected({LCW{7, 3}, LCW{4, 2}});
+  auto result = cudf::segmented_top_k(input, offsets, 2);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected, result->view());
+
+  LCW expected_asc({LCW{-5, -1}, LCW{-8, 0}});
+  result = cudf::segmented_top_k(input, offsets, 2, cudf::order::ASCENDING);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected_asc, result->view());
+}
+
+// Duplicates at the k-th boundary. CUB selects with tie_break::unspecified, so which of
+// the equal rows is picked is not guaranteed to match the sort path; only the selected
+// values are well defined, and that is all this asserts.
+TEST_F(TopK, TopKSegmentedFastPathTies)
+{
+  using LCW = cudf::test::lists_column_wrapper<int32_t>;
+
+  auto input   = cudf::test::fixed_width_column_wrapper<int32_t>({5, 5, 5, 5, 1, 9, 9, 1, 1, 1});
+  auto offsets = cudf::test::fixed_width_column_wrapper<int32_t>({0, 5, 10});
+
+  LCW expected({LCW{5, 5}, LCW{9, 9}});
+  auto result = cudf::segmented_top_k(input, offsets, 2);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected, result->view());
+}
