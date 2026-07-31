@@ -142,11 +142,17 @@ std::unique_ptr<column> sort_based_segmented_top_k_order(column_view const& col,
 /**
  * @brief Upper bound on the segment size handled by the CUB fast path
  *
- * cub::DeviceBatchedTopK needs a compile-time maximum for its segment-size argument, and
- * a looser bound costs more temporary storage. Segments larger than this take the
- * sort-based path instead.
+ * cub::DeviceBatchedTopK processes one segment per thread block and rejects, at compile
+ * time, any statically-known maximum no policy can cover within the shared-memory limit;
+ * 2048 is the largest value that compiles for every type instantiated here. Segments
+ * larger than this take the sort-based path instead.
+ *
+ * A looser bound also costs more temporary storage, but measuring the two candidates
+ * showed the wider bound is worth it: raising 1024 to 2048 slowed 1024-row segments by
+ * roughly a tenth while making 2048-row segments, which would otherwise fall back to a
+ * full sort, about two orders of magnitude faster.
  */
-constexpr size_type cub_max_segment_size = 1024;
+constexpr size_type cub_max_segment_size = 2048;
 
 /**
  * @brief Returns true if the column's type is supported by the CUB fast path
