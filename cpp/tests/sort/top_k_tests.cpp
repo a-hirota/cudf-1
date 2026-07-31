@@ -543,9 +543,9 @@ TEST_F(TopK, TopKSegmentedFastPathRejectsSegmentSmallerThanK)
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected_order, result->view());
 }
 
-// Straddles the internal segment-size bound: 1024 rows is the largest segment the fast
-// path currently accepts and 1025 forces the fallback. Both must give the same answer, so
-// this stays correct if the bound is later raised (CUB compiles up to 2048 today).
+// Straddles the internal segment-size bound: 2048 rows is the largest segment the fast
+// path accepts (the most CUB compiles for) and 2049 forces the fallback. Both must give
+// the same answer, so this stays correct if the bound is later raised.
 TEST_F(TopK, TopKSegmentedFastPathSegmentSizeBound)
 {
   using LCW  = cudf::test::lists_column_wrapper<int32_t>;
@@ -553,22 +553,22 @@ TEST_F(TopK, TopKSegmentedFastPathSegmentSizeBound)
 
   auto itr = cuda::counting_iterator<int32_t>{0};
   {
-    auto input   = cudf::test::fixed_width_column_wrapper<int32_t>(itr, itr + 1024);
-    auto offsets = cudf::test::fixed_width_column_wrapper<int32_t>({0, 1024});
-    LCW expected({LCW{1023, 1022}});
+    auto input   = cudf::test::fixed_width_column_wrapper<int32_t>(itr, itr + 2048);
+    auto offsets = cudf::test::fixed_width_column_wrapper<int32_t>({0, 2048});
+    LCW expected({LCW{2047, 2046}});
     auto result = cudf::segmented_top_k(input, offsets, 2);
     CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected, result->view());
-    LCWO expected_order({LCWO{1023, 1022}});
+    LCWO expected_order({LCWO{2047, 2046}});
     result = cudf::segmented_top_k_order(input, offsets, 2);
     CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected_order, result->view());
   }
   {
-    auto input   = cudf::test::fixed_width_column_wrapper<int32_t>(itr, itr + 1025);
-    auto offsets = cudf::test::fixed_width_column_wrapper<int32_t>({0, 1025});
-    LCW expected({LCW{1024, 1023}});
+    auto input   = cudf::test::fixed_width_column_wrapper<int32_t>(itr, itr + 2049);
+    auto offsets = cudf::test::fixed_width_column_wrapper<int32_t>({0, 2049});
+    LCW expected({LCW{2048, 2047}});
     auto result = cudf::segmented_top_k(input, offsets, 2);
     CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected, result->view());
-    LCWO expected_order({LCWO{1024, 1023}});
+    LCWO expected_order({LCWO{2048, 2047}});
     result = cudf::segmented_top_k_order(input, offsets, 2);
     CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected_order, result->view());
   }
