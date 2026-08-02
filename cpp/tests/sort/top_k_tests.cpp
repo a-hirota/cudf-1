@@ -18,6 +18,7 @@
 
 #include <cuda/iterator>
 
+#include <limits>
 #include <type_traits>
 #include <vector>
 
@@ -703,4 +704,47 @@ TEST_F(TopK, TopKSegmentedFewLargePartitionsSegmentCountBound)
     auto result = cudf::segmented_top_k(input, offsets, 2);
     CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected->view(), result->view());
   }
+}
+
+// Floating-point columns qualify for the CUB fast paths only while the data holds no
+// NaN: without NaN the radix bit order matches IEEE comparisons, but cudf treats every
+// NaN as the largest value, which the bit order breaks for negative-sign NaNs. NaN data
+// must therefore take the sort-based path and keep today's NaN-is-largest results.
+TEST_F(TopK, TopKSegmentedFloatNaNFallsBack)
+{
+  using LCW = cudf::test::lists_column_wrapper<double>;
+
+  auto const nan = std::numeric_limits<double>::quiet_NaN();
+  auto input =
+    cudf::test::fixed_width_column_wrapper<double>({5.0, nan, 3.0, 8.0, -nan, 7.0, 2.0, 9.0});
+  auto offsets = cudf::test::fixed_width_column_wrapper<int32_t>({0, 4, 8});
+
+  // Descending: NaN sorts as the largest value regardless of its sign bit.
+  LCW expected({LCW{nan, 8.0}, LCW{nan, 9.0}});
+  auto result = cudf::segmented_top_k(input, offsets, 2);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected, result->view());
+
+  // Ascending: NaN sorts last, so the smallest two are plain values.
+  LCW expected_asc({LCW{3.0, 5.0}, LCW{2.0, 7.0}});
+  result = cudf::segmented_top_k(input, offsets, 2, cudf::order::ASCENDING);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected_asc, result->view());
+}
+
+// NaN-free floating-point data takes the fast paths and must match the sort path's
+// values exactly (the typed TopKSegmentedFastPath case covers f32/f64 batched; this
+// covers the per-segment path with doubles at Q67-like sizes).
+TEST_F(TopK, TopKSegmentedFloatFewLargePartitions)
+{
+  using LCW = cudf::test::lists_column_wrapper<double>;
+
+  auto h_values = std::vector<double>(9000);
+  for (int32_t i = 0; i < 9000; ++i) {
+    h_values[i] = static_cast<double>(i) * 0.5;
+  }
+  auto input   = cudf::test::fixed_width_column_wrapper<double>(h_values.begin(), h_values.end());
+  auto offsets = cudf::test::fixed_width_column_wrapper<int32_t>({0, 3000, 6000, 9000});
+
+  LCW expected({LCW{1499.5, 1499.0}, LCW{2999.5, 2999.0}, LCW{4499.5, 4499.0}});
+  auto result = cudf::segmented_top_k(input, offsets, 2);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected, result->view());
 }
