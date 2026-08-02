@@ -37,6 +37,7 @@
 #include <thrust/execution_policy.h>
 #include <thrust/functional.h>
 #include <thrust/iterator/counting_iterator.h>
+#include <thrust/logical.h>
 #include <thrust/remove.h>
 #include <thrust/sequence.h>
 #include <thrust/transform.h>
@@ -186,16 +187,40 @@ size_type cub_max_segment_size_for_device()
   return cub_max_segment_size;
 }
 
+struct has_nans_fn {
+  template <typename T>
+    requires(cudf::is_floating_point<T>())
+  bool operator()(column_view const& column, rmm::cuda_stream_view stream)
+  {
+    return thrust::any_of(rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
+                          column.begin<T>(),
+                          column.end<T>(),
+                          [] __device__(T value) -> bool { return cuda::std::isnan(value); });
+  }
+
+  template <typename T>
+    requires(not cudf::is_floating_point<T>())
+  bool operator()(column_view const&, rmm::cuda_stream_view)
+  {
+    CUDF_UNREACHABLE("has_nans_fn used on a non-floating-point column");
+  }
+};
+
 /**
- * @brief Returns true if the column's type is supported by the CUB fast path
+ * @brief Returns true if the column qualifies for the CUB fast paths
  *
- * Mirrors the condition used by the non-segmented top_k in top_k.cu: no nulls, and a
- * fixed-width non-floating-point type (floating point needs special NaN handling).
+ * Like the non-segmented top_k in top_k.cu the column must be fixed-width with no
+ * nulls. Floating-point columns additionally qualify only when the data holds no NaN:
+ * without NaN, CUB's radix bit transform orders floats exactly as IEEE comparisons do,
+ * while any NaN (negative-sign NaNs in particular, which the bit transform places
+ * smallest) would break cudf's convention of treating NaN as the largest value. The
+ * scan is one read of the column -- negligible next to the selection it enables.
  */
-bool is_fast_path(column_view const& column)
+bool is_fast_path(column_view const& column, rmm::cuda_stream_view stream)
 {
-  return !column.has_nulls() && cudf::is_fixed_width(column.type()) &&
-         !cudf::is_floating_point(column.type());
+  if (column.has_nulls() || !cudf::is_fixed_width(column.type())) { return false; }
+  if (!cudf::is_floating_point(column.type())) { return true; }
+  return !type_dispatcher(column.type(), has_nans_fn{}, column, stream);
 }
 
 /**
@@ -467,7 +492,7 @@ struct dispatch_segmented_topk_fn {
   rmm::device_async_resource_ref mr;
 
   template <typename T>
-    requires(cudf::is_fixed_width<T>() and !cudf::is_floating_point<T>() and !cudf::is_chrono<T>())
+    requires(cudf::is_fixed_width<T>() and !cudf::is_chrono<T>())
   std::unique_ptr<column> operator()()
   {
     return batched
@@ -484,7 +509,7 @@ struct dispatch_segmented_topk_fn {
   }
 
   template <typename T>
-    requires(not cudf::is_fixed_width<T>() or cudf::is_floating_point<T>())
+    requires(not cudf::is_fixed_width<T>())
   std::unique_ptr<column> operator()()
   {
     CUDF_UNREACHABLE("unexpected type for segmented_top_k fast path");
@@ -503,7 +528,7 @@ bool can_use_cub_batched_topk(column_view const& col,
                               size_type k,
                               rmm::cuda_stream_view stream)
 {
-  if (!is_fast_path(col)) { return false; }
+  if (!is_fast_path(col, stream)) { return false; }
 
   auto const num_segments = segment_offsets.size() - 1;
   if (num_segments <= 0) { return false; }
@@ -548,7 +573,7 @@ std::unique_ptr<column> segmented_top_k_order(column_view const& col,
                "segment_offsets must not have nulls",
                std::invalid_argument);
 
-  if (is_fast_path(col)) {
+  if (is_fast_path(col, stream)) {
     if (can_use_cub_batched_topk(col, segment_offsets, k, stream)) {
       return type_dispatcher<dispatch_storage_type>(
         col.type(),
