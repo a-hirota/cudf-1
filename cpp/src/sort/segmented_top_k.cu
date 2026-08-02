@@ -39,6 +39,7 @@
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/remove.h>
 #include <thrust/sequence.h>
+#include <thrust/transform.h>
 #include <thrust/transform_reduce.h>
 
 #include <vector>
@@ -144,19 +145,46 @@ std::unique_ptr<column> sort_based_segmented_top_k_order(column_view const& col,
 }
 
 /**
- * @brief Upper bound on the segment size handled by the CUB fast path
+ * @brief Upper bound on the segment size handled by the batched CUB fast path
  *
- * cub::DeviceBatchedTopK processes one segment per thread block and rejects, at compile
- * time, any statically-known maximum no policy can cover within the shared-memory limit;
- * 2048 is the largest value that compiles for every type instantiated here. Segments
- * larger than this take the sort-based path instead.
+ * cub::DeviceBatchedTopK's baseline backend processes one segment per thread block and
+ * rejects, at compile time, any statically-known maximum no policy can cover within the
+ * shared-memory limit; 2048 is the largest value that compiles for every type
+ * instantiated here.
  *
  * A looser bound also costs more temporary storage, but measuring the two candidates
  * showed the wider bound is worth it: raising 1024 to 2048 slowed 1024-row segments by
  * roughly a tenth while making 2048-row segments, which would otherwise fall back to a
  * full sort, about two orders of magnitude faster.
+ *
+ * CUB versions carrying the thread-block-cluster backend (CCCL PR 9224) route segments
+ * beyond the baseline bound to that backend instead of rejecting them, raising the
+ * per-segment limit to 2^21 rows -- but only on devices with clusters (SM 9.0+), which
+ * cub_max_segment_size_for_device() checks at run time.
  */
+#if __has_include(<cub/agent/agent_batched_topk_cluster.cuh>)
+constexpr size_type cub_max_segment_size = size_type{1} << 21;
+constexpr bool cub_has_cluster_backend   = true;
+#else
 constexpr size_type cub_max_segment_size = 2048;
+constexpr bool cub_has_cluster_backend   = false;
+#endif
+constexpr size_type cub_baseline_max_segment_size = 2048;
+
+/**
+ * @brief Returns the largest segment the batched CUB path may take on this device
+ */
+size_type cub_max_segment_size_for_device()
+{
+  if constexpr (cub_has_cluster_backend) {
+    int device = 0;
+    CUDF_CUDA_TRY(cudaGetDevice(&device));
+    int cluster_launch = 0;
+    CUDF_CUDA_TRY(cudaDeviceGetAttribute(&cluster_launch, cudaDevAttrClusterLaunch, device));
+    if (cluster_launch == 0) { return cub_baseline_max_segment_size; }
+  }
+  return cub_max_segment_size;
+}
 
 /**
  * @brief Returns true if the column's type is supported by the CUB fast path
@@ -253,11 +281,18 @@ std::unique_ptr<column> cub_segmented_top_k_order(column_view const& col,
       return d_out + static_cast<std::size_t>(i) * k;
     });
 
+  // Materialized rather than a transform iterator: newer CUB requires the
+  // deferred_sequence to wrap a random-access iterator over integral values, which a
+  // device pointer satisfies on every CCCL version we build against.
+  auto sizes = rmm::device_uvector<size_type>(num_segments, stream);
+  thrust::transform(
+    rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
+    thrust::counting_iterator<size_type>(0),
+    thrust::counting_iterator<size_type>(num_segments),
+    sizes.begin(),
+    [d_offsets] __device__(size_type i) -> size_type { return d_offsets[i + 1] - d_offsets[i]; });
   auto segment_sizes = cuda::args::deferred_sequence{
-    cudf::detail::make_counting_transform_iterator(
-      0,
-      [d_offsets] __device__(size_type i) -> size_type { return d_offsets[i + 1] - d_offsets[i]; }),
-    cuda::args::static_bounds<0, cub_max_segment_size>{}};
+    sizes.data(), cuda::args::static_bounds<0, cub_max_segment_size>{}};
 
   auto requirements = cuda::execution::require(cuda::execution::determinism::not_guaranteed,
                                                cuda::execution::tie_break::unspecified,
@@ -474,15 +509,16 @@ bool can_use_cub_batched_topk(column_view const& col,
   if (num_segments <= 0) { return false; }
 
   // Reduce straight to the answer in a single pass: the sizes themselves are not needed,
-  // only whether every segment is within [k, cub_max_segment_size].
+  // only whether every segment is within [k, the largest this device's backends take].
+  auto const max_size  = cub_max_segment_size_for_device();
   auto const d_offsets = segment_offsets.begin<size_type>();
   return thrust::transform_reduce(
     rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
     thrust::counting_iterator<size_type>(0),
     thrust::counting_iterator<size_type>(num_segments),
-    [d_offsets, k] __device__(size_type i) -> bool {
+    [d_offsets, k, max_size] __device__(size_type i) -> bool {
       auto const size = d_offsets[i + 1] - d_offsets[i];
-      return size >= k && size <= cub_max_segment_size;
+      return size >= k && size <= max_size;
     },
     true,
     thrust::logical_and<bool>{});
