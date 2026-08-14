@@ -1159,6 +1159,7 @@ struct dictionary_caster {
                                                                     total_row_groups,
                                                                     physical_type);
 
+    stream.synchronize();
     // Build the BOOL8 columns from the results buffers
     return build_columns(results_buffers, stream, mr);
   }

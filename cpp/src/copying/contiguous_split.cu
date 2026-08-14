@@ -1658,6 +1658,7 @@ std::unique_ptr<chunk_iteration_state> chunk_iteration_state::create(
           d_batched_dst_buf_info[i].dst_offset -= *prior_iteration_size;
         });
     }
+    stream.synchronize();
     return std::make_unique<chunk_iteration_state>(std::move(d_batched_dst_buf_info),
                                                    std::move(d_batch_offsets),
                                                    std::move(num_batches_per_iteration),

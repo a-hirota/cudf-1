@@ -1,6 +1,6 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2021-2026, NVIDIA CORPORATION.
- * SPDX-License-Identifier: Apache-2.0
+ * SPDX-FileCopyrightText: Copyright (c) 2021-2026, NVIDIA CORPORATION & AFFILIATES. All rights
+ * reserved. SPDX-License-Identifier: Apache-2.0
  */
 
 #include <cudf/column/column.hpp>
@@ -553,6 +553,7 @@ std::unique_ptr<column> segmented_row_bit_count(table_view const& t,
     segment_length,
     h_info.max_branch_depth);
 
+  stream.synchronize();
   return output;
 }
 

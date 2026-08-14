@@ -428,7 +428,7 @@ struct page_stats_caster : public stats_caster_base {
                                                            total_rows,
                                                            stream,
                                                            cudf::get_current_device_resource_ref());
-
+      stream.synchronize();
       // For non-strings columns, directly gather the page-level column data and bitmask to the
       // row-level.
       if constexpr (not cuda::std::is_same_v<T, cudf::string_view>) {
@@ -597,6 +597,7 @@ struct page_stats_to_row_mask_converter : public page_stats_caster {
               stream)
           : cudf::detail::make_empty_host_vector<bitmask_type>(0, stream);
 
+      stream.synchronize();
       auto [row_mask_data, row_mask_bitmask] =
         build_data_and_nullmask<bool>(page_mask->mutable_view(),
                                       page_mask_nullmask.data(),
