@@ -616,18 +616,19 @@ TEST_F(TopK, TopKSegmentedFewLargePartitions)
   using LCWO = cudf::test::lists_column_wrapper<cudf::size_type>;
 
   auto itr     = cuda::counting_iterator<int32_t>{0};
-  auto input   = cudf::test::fixed_width_column_wrapper<int32_t>(itr, itr + 9000);
-  auto offsets = cudf::test::fixed_width_column_wrapper<int32_t>({0, 3000, 6000, 9000});
+  auto input   = cudf::test::fixed_width_column_wrapper<int32_t>(itr, itr + 60000);
+  auto offsets = cudf::test::fixed_width_column_wrapper<int32_t>({0, 20000, 40000, 60000});
 
-  LCW expected({LCW{2999, 2998, 2997}, LCW{5999, 5998, 5997}, LCW{8999, 8998, 8997}});
+  LCW expected({LCW{19999, 19998, 19997}, LCW{39999, 39998, 39997}, LCW{59999, 59998, 59997}});
   auto result = cudf::segmented_top_k(input, offsets, 3);
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected, result->view());
 
-  LCWO expected_order({LCWO{2999, 2998, 2997}, LCWO{5999, 5998, 5997}, LCWO{8999, 8998, 8997}});
+  LCWO expected_order(
+    {LCWO{19999, 19998, 19997}, LCWO{39999, 39998, 39997}, LCWO{59999, 59998, 59997}});
   result = cudf::segmented_top_k_order(input, offsets, 3);
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected_order, result->view());
 
-  LCW expected_asc({LCW{0, 1, 2}, LCW{3000, 3001, 3002}, LCW{6000, 6001, 6002}});
+  LCW expected_asc({LCW{0, 1, 2}, LCW{20000, 20001, 20002}, LCW{40000, 40001, 40002}});
   result = cudf::segmented_top_k(input, offsets, 3, cudf::order::ASCENDING);
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected_asc, result->view());
 }
@@ -640,15 +641,15 @@ TEST_F(TopK, TopKSegmentedFewLargePartitionsRagged)
   using LCWO = cudf::test::lists_column_wrapper<cudf::size_type>;
 
   auto itr     = cuda::counting_iterator<int32_t>{0};
-  auto input   = cudf::test::fixed_width_column_wrapper<int32_t>(itr, itr + 5002);
-  auto offsets = cudf::test::fixed_width_column_wrapper<int32_t>({0, 5000, 5000, 5002});
+  auto input   = cudf::test::fixed_width_column_wrapper<int32_t>(itr, itr + 50002);
+  auto offsets = cudf::test::fixed_width_column_wrapper<int32_t>({0, 50000, 50000, 50002});
 
   // Segment 1 is empty; segment 2 holds two rows, fewer than k=3.
-  LCW expected({LCW{4999, 4998, 4997}, LCW{}, LCW{5001, 5000}});
+  LCW expected({LCW{49999, 49998, 49997}, LCW{}, LCW{50001, 50000}});
   auto result = cudf::segmented_top_k(input, offsets, 3);
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected, result->view());
 
-  LCWO expected_order({LCWO{4999, 4998, 4997}, LCWO{}, LCWO{5001, 5000}});
+  LCWO expected_order({LCWO{49999, 49998, 49997}, LCWO{}, LCWO{50001, 50000}});
   result = cudf::segmented_top_k_order(input, offsets, 3);
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected_order, result->view());
 }
@@ -660,11 +661,11 @@ TEST_F(TopK, TopKSegmentedFewLargePartitionsUncovered)
   using LCW = cudf::test::lists_column_wrapper<int32_t>;
 
   auto itr     = cuda::counting_iterator<int32_t>{0};
-  auto input   = cudf::test::fixed_width_column_wrapper<int32_t>(itr, itr + 8000);
-  auto offsets = cudf::test::fixed_width_column_wrapper<int32_t>({1000, 4000, 7000});
+  auto input   = cudf::test::fixed_width_column_wrapper<int32_t>(itr, itr + 80000);
+  auto offsets = cudf::test::fixed_width_column_wrapper<int32_t>({10000, 40000, 70000});
 
-  // Rows 0-999 and 7000-7999 lie outside every segment.
-  LCW expected({LCW{3999, 3998}, LCW{6999, 6998}});
+  // Rows 0-9999 and 70000-79999 lie outside every segment.
+  LCW expected({LCW{39999, 39998}, LCW{69999, 69998}});
   auto result = cudf::segmented_top_k(input, offsets, 2);
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected, result->view());
 }
@@ -676,7 +677,7 @@ TEST_F(TopK, TopKSegmentedFewLargePartitionsSegmentCountBound)
 {
   auto itr = cuda::counting_iterator<int32_t>{0};
   for (int32_t num_segments : {64, 65}) {
-    auto const seg   = 2100;  // above the batched path's 2048-row bound
+    auto const seg   = 20000;  // above the batched path's bound and the average-size guard
     auto const total = num_segments * seg;
     auto input       = cudf::test::fixed_width_column_wrapper<int32_t>(itr, itr + total);
     auto h_offsets   = std::vector<int32_t>(num_segments + 1);
@@ -737,14 +738,14 @@ TEST_F(TopK, TopKSegmentedFloatFewLargePartitions)
 {
   using LCW = cudf::test::lists_column_wrapper<double>;
 
-  auto h_values = std::vector<double>(9000);
-  for (int32_t i = 0; i < 9000; ++i) {
+  auto h_values = std::vector<double>(60000);
+  for (int32_t i = 0; i < 60000; ++i) {
     h_values[i] = static_cast<double>(i) * 0.5;
   }
   auto input   = cudf::test::fixed_width_column_wrapper<double>(h_values.begin(), h_values.end());
-  auto offsets = cudf::test::fixed_width_column_wrapper<int32_t>({0, 3000, 6000, 9000});
+  auto offsets = cudf::test::fixed_width_column_wrapper<int32_t>({0, 20000, 40000, 60000});
 
-  LCW expected({LCW{1499.5, 1499.0}, LCW{2999.5, 2999.0}, LCW{4499.5, 4499.0}});
+  LCW expected({LCW{9999.5, 9999.0}, LCW{19999.5, 19999.0}, LCW{29999.5, 29999.0}});
   auto result = cudf::segmented_top_k(input, offsets, 2);
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected, result->view());
 }
