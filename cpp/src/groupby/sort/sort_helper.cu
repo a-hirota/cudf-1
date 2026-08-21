@@ -171,6 +171,7 @@ sort_groupby_helper::index_vector const& sort_groupby_helper::group_offsets(
   auto const num_groups = cuda::std::distance(group_offsets->begin(), result_end);
   group_offsets->set_element_async(num_groups, size, stream);
   group_offsets->resize(num_groups + 1, stream);
+  stream.synchronize();
 
   _group_offsets = std::move(group_offsets);
   return *_group_offsets;
