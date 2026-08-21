@@ -394,6 +394,13 @@ std::unique_ptr<column> cub_segmented_top_k_order(column_view const& col,
  */
 constexpr size_type cub_topk_loop_max_segments = 64;
 
+// Crossover-measured bounds from the upstream review of the per-segment path
+// (rapidsai/cudf#23602): below this average covered segment size the segmented
+// sort is faster, and as k approaches the segment size the post-selection sort
+// approaches the full sort this path avoids.
+constexpr size_type cub_topk_loop_min_avg_segment_size = 16384;
+constexpr size_type cub_topk_loop_max_k_fraction       = 8;
+
 /**
  * @brief Computes the top k indices per segment with one cub::DeviceTopK call per segment
  *
@@ -583,9 +590,17 @@ std::unique_ptr<column> segmented_top_k_order(column_view const& col,
     // k): select each one with a full-device cub::DeviceTopK call instead.
     if (auto const num_segments = segment_offsets.size() - 1;
         num_segments > 0 && num_segments <= cub_topk_loop_max_segments) {
-      return type_dispatcher<dispatch_storage_type>(
-        col.type(),
-        dispatch_segmented_topk_fn{col, segment_offsets, k, topk_order, false, stream, mr});
+      auto const bounds = cudf::detail::make_host_vector(
+        device_span<size_type const>{segment_offsets.begin<size_type>(),
+                                     static_cast<std::size_t>(num_segments) + 1},
+        stream);
+      auto const avg_segment_size = (bounds.back() - bounds.front()) / num_segments;
+      if (avg_segment_size >= cub_topk_loop_min_avg_segment_size &&
+          k <= avg_segment_size / cub_topk_loop_max_k_fraction) {
+        return type_dispatcher<dispatch_storage_type>(
+          col.type(),
+          dispatch_segmented_topk_fn{col, segment_offsets, k, topk_order, false, stream, mr});
+      }
     }
   }
 
