@@ -89,6 +89,7 @@ auto create_device_views(host_span<column_view const> views, rmm::cuda_stream_vi
   auto d_offsets =
     make_device_uvector_async(offsets, stream, cudf::get_current_device_resource_ref());
   auto const output_size = offsets.back();
+  stream.synchronize();
 
   return std::make_tuple(
     std::move(device_view_owners), std::move(d_views), std::move(d_offsets), output_size);
