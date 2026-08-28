@@ -658,7 +658,8 @@ TEST_F(TopK, TopKSegmentedFewLargePartitionsRagged)
 // path, exactly as on the sort-based path.
 TEST_F(TopK, TopKSegmentedFewLargePartitionsUncovered)
 {
-  using LCW = cudf::test::lists_column_wrapper<int32_t>;
+  using LCW  = cudf::test::lists_column_wrapper<int32_t>;
+  using LCWO = cudf::test::lists_column_wrapper<cudf::size_type>;
 
   auto itr     = cuda::counting_iterator<int32_t>{0};
   auto input   = cudf::test::fixed_width_column_wrapper<int32_t>(itr, itr + 80000);
@@ -668,6 +669,10 @@ TEST_F(TopK, TopKSegmentedFewLargePartitionsUncovered)
   LCW expected({LCW{39999, 39998}, LCW{69999, 69998}});
   auto result = cudf::segmented_top_k(input, offsets, 2);
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected, result->view());
+
+  LCWO expected_order({LCWO{39999, 39998}, LCWO{69999, 69998}});
+  result = cudf::segmented_top_k_order(input, offsets, 2);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected_order, result->view());
 }
 
 // Straddles the per-segment path's segment-count bound (64): 64 large segments use the
@@ -748,4 +753,62 @@ TEST_F(TopK, TopKSegmentedFloatFewLargePartitions)
   LCW expected({LCW{9999.5, 9999.0}, LCW{19999.5, 19999.0}, LCW{29999.5, 29999.0}});
   auto result = cudf::segmented_top_k(input, offsets, 2);
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected, result->view());
+}
+
+// Ties at the k boundary have deterministic values but unspecified selected row indices.
+TEST_F(TopK, TopKSegmentedFewLargePartitionsWithTies)
+{
+  // Each segment holds 200 copies of every value in [0, 100).
+  auto itr     = cuda::make_transform_iterator(cuda::counting_iterator<int32_t>{0},
+                                           [] __device__(int32_t i) { return i % 100; });
+  auto input   = cudf::test::fixed_width_column_wrapper<int32_t>(itr, itr + 60000);
+  auto offsets = cudf::test::fixed_width_column_wrapper<int32_t>({0, 20000, 40000, 60000});
+
+  auto sorted_values = [](cudf::column_view const& lists_col, cudf::order sort_order) {
+    auto lists = cudf::lists_column_view(lists_col);
+    return cudf::segmented_sort_by_key(cudf::table_view({lists.child()}),
+                                       cudf::table_view({lists.child()}),
+                                       lists.offsets(),
+                                       {sort_order});
+  };
+
+  // k = 300 takes all 200 copies of the extreme value and 100 of the next one.
+  auto desc_itr =
+    cuda::make_transform_iterator(cuda::counting_iterator<int32_t>{0},
+                                  [] __device__(int32_t i) { return (i % 300) < 200 ? 99 : 98; });
+  auto expected_desc = cudf::test::fixed_width_column_wrapper<int32_t>(desc_itr, desc_itr + 900);
+  auto result        = cudf::segmented_top_k(input, offsets, 300);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(
+    expected_desc, sorted_values(result->view(), cudf::order::DESCENDING)->view().column(0));
+
+  auto asc_itr =
+    cuda::make_transform_iterator(cuda::counting_iterator<int32_t>{0},
+                                  [] __device__(int32_t i) { return (i % 300) < 200 ? 0 : 1; });
+  auto expected_asc = cudf::test::fixed_width_column_wrapper<int32_t>(asc_itr, asc_itr + 900);
+  result            = cudf::segmented_top_k(input, offsets, 300, cudf::order::ASCENDING);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(
+    expected_asc, sorted_values(result->view(), cudf::order::ASCENDING)->view().column(0));
+
+  // The selected indices are unspecified among equal values, but must point at those values.
+  auto gathered_values = [&](cudf::column_view const& order_col) {
+    auto lists  = cudf::lists_column_view(order_col);
+    auto values = cudf::gather(cudf::table_view({input}), lists.child());
+    return cudf::make_lists_column(lists.size(),
+                                   std::make_unique<cudf::column>(lists.offsets()),
+                                   std::move(values->release().front()),
+                                   0,
+                                   rmm::device_buffer{});
+  };
+  auto order = cudf::segmented_top_k_order(input, offsets, 300);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(
+    expected_desc,
+    sorted_values(gathered_values(order->view())->view(), cudf::order::DESCENDING)
+      ->view()
+      .column(0));
+  order = cudf::segmented_top_k_order(input, offsets, 300, cudf::order::ASCENDING);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(
+    expected_asc,
+    sorted_values(gathered_values(order->view())->view(), cudf::order::ASCENDING)
+      ->view()
+      .column(0));
 }
