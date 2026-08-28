@@ -172,6 +172,10 @@ constexpr size_type cub_max_segment_size = 2048;
 constexpr bool cub_has_cluster_backend   = false;
 #endif
 constexpr size_type cub_baseline_max_segment_size = 2048;
+// Crossover measurements on the target SM 12.1 device found the cluster backend
+// faster for every tested shape through 1 Mi rows per segment. At 2 Mi rows and
+// 2--10 segments, one full-device DeviceTopK call per segment matched or beat it.
+constexpr size_type cub_cluster_preferred_max_segment_size = size_type{1} << 20;
 
 /**
  * @brief Returns the largest segment the batched CUB path may take on this device
@@ -274,7 +278,7 @@ std::unique_ptr<column> sorted_top_k_lists(std::unique_ptr<column> offsets,
  * The output within a segment is unordered and may be non-deterministic, which the CUB
  * API requires us to acknowledge through the execution environment.
  */
-template <typename T>
+template <typename T, size_type StaticMaxSegmentSize>
 std::unique_ptr<column> cub_segmented_top_k_order(column_view const& col,
                                                   column_view const& segment_offsets,
                                                   size_type k,
@@ -282,6 +286,9 @@ std::unique_ptr<column> cub_segmented_top_k_order(column_view const& col,
                                                   rmm::cuda_stream_view stream,
                                                   rmm::device_async_resource_ref mr)
 {
+  static_assert(StaticMaxSegmentSize == cub_baseline_max_segment_size ||
+                StaticMaxSegmentSize == cub_max_segment_size);
+
   auto const num_segments = segment_offsets.size() - 1;
   auto const d_offsets    = segment_offsets.begin<size_type>();
 
@@ -318,7 +325,7 @@ std::unique_ptr<column> cub_segmented_top_k_order(column_view const& col,
     sizes.begin(),
     [d_offsets] __device__(size_type i) -> size_type { return d_offsets[i + 1] - d_offsets[i]; });
   auto segment_sizes = cuda::args::deferred_sequence{
-    sizes.data(), cuda::args::static_bounds<0, cub_max_segment_size>{}};
+    sizes.data(), cuda::args::static_bounds<0, StaticMaxSegmentSize>{}};
 
   auto requirements = cuda::execution::require(cuda::execution::determinism::not_guaranteed,
                                                cuda::execution::tie_break::unspecified,
@@ -495,7 +502,7 @@ struct dispatch_segmented_top_k_fn {
   column_view segment_offsets;
   size_type k;
   order topk_order;
-  bool batched;  // one thread block per segment vs. one full-device selection per segment
+  size_type batched_static_bound;  // zero selects one full-device call per segment
   rmm::cuda_stream_view stream;
   rmm::device_async_resource_ref mr;
 
@@ -503,9 +510,15 @@ struct dispatch_segmented_top_k_fn {
     requires(cudf::is_fixed_width<T>() and !cudf::is_chrono<T>())
   std::unique_ptr<column> operator()()
   {
-    return batched
-             ? cub_segmented_top_k_order<T>(col, segment_offsets, k, topk_order, stream, mr)
-             : cub_per_segment_top_k_order<T>(col, segment_offsets, k, topk_order, stream, mr);
+    if (batched_static_bound == 0) {
+      return cub_per_segment_top_k_order<T>(col, segment_offsets, k, topk_order, stream, mr);
+    }
+    if (batched_static_bound == cub_baseline_max_segment_size) {
+      return cub_segmented_top_k_order<T, cub_baseline_max_segment_size>(
+        col, segment_offsets, k, topk_order, stream, mr);
+    }
+    return cub_segmented_top_k_order<T, cub_max_segment_size>(
+      col, segment_offsets, k, topk_order, stream, mr);
   }
 
   template <typename T>
@@ -525,39 +538,56 @@ struct dispatch_segmented_top_k_fn {
 };
 
 /**
- * @brief Returns true if cub::DeviceBatchedTopK can be used for these segments
+ * @brief Selects the static bound for cub::DeviceBatchedTopK, or zero when it cannot be used
  *
  * Beyond the type/null requirements, the CUB path needs every segment to fit the
  * compile-time size bound, and needs no segment to be smaller than k, since it emits
  * exactly k indices per segment while the sort path emits min(k, segment_size).
  */
-bool can_use_cub_batched_top_k(column_view const& col,
-                               column_view const& segment_offsets,
-                               size_type k,
-                               rmm::cuda_stream_view stream)
+size_type cub_batched_top_k_static_bound(column_view const& col,
+                                         column_view const& segment_offsets,
+                                         size_type k,
+                                         rmm::cuda_stream_view stream)
 {
   auto const num_segments = segment_offsets.size() - 1;
-  if (num_segments <= 0) { return false; }
+  if (num_segments <= 0) { return 0; }
 
-  // Reduce straight to the answer in a single pass: the sizes themselves are not needed,
-  // only whether the offsets are valid and every segment is within [k, the largest this
-  // device's backends take]. The caller has already checked the column type and nulls.
-  auto const max_size  = cub_max_segment_size_for_device();
-  auto const col_size  = col.size();
-  auto const d_offsets = segment_offsets.begin<size_type>();
-  return thrust::transform_reduce(
+  // Reduce straight to the largest valid segment in one pass. An invalid segment maps
+  // to one past the supported maximum, so the same maximum reduction also rejects bad
+  // offsets, segments smaller than k, and segments too large for this device.
+  auto const max_supported = cub_max_segment_size_for_device();
+  auto const invalid       = max_supported + 1;
+  auto const col_size      = col.size();
+  auto const d_offsets     = segment_offsets.begin<size_type>();
+  auto const largest       = thrust::transform_reduce(
     rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
     thrust::counting_iterator<size_type>(0),
     thrust::counting_iterator<size_type>(num_segments),
-    [d_offsets, k, max_size, col_size] __device__(size_type i) -> bool {
+    [d_offsets, k, max_supported, col_size, invalid] __device__(size_type i) -> size_type {
       auto const begin = d_offsets[i];
       auto const end   = d_offsets[i + 1];
-      if (begin < 0 || end < begin || end > col_size) { return false; }
+      if (begin < 0 || end < begin || end > col_size) { return invalid; }
       auto const size = end - begin;
-      return size >= k && size <= max_size;
+      return size >= k && size <= max_supported ? size : invalid;
     },
-    true,
-    thrust::logical_and<bool>{});
+    size_type{0},
+    thrust::maximum<size_type>{});
+
+  if (largest > max_supported) { return 0; }
+  // CUB selects its backend from this static upper bound. Preserve the narrow baseline
+  // bound when every actual segment fits it; always advertising 2^21 would route even
+  // 2048-row segments to the cluster backend, which is substantially slower there.
+  if (largest <= cub_baseline_max_segment_size) { return cub_baseline_max_segment_size; }
+
+  // Prefer the cluster backend through the measured 1 Mi-row crossover. Above that,
+  // let a small number of segments use one full-device DeviceTopK call each. More than
+  // 64 segments cannot use that loop and would otherwise fall back to a full sort; the
+  // measured 80-segment case showed that cliff clearly, so keep the cluster path there.
+  if (largest <= cub_cluster_preferred_max_segment_size ||
+      num_segments > cub_topk_loop_max_segments) {
+    return cub_max_segment_size;
+  }
+  return 0;
 }
 }  // namespace
 
@@ -585,10 +615,11 @@ std::unique_ptr<column> segmented_top_k_order(column_view const& col,
                std::invalid_argument);
 
   if (is_fast_path(col, stream)) {
-    if (can_use_cub_batched_top_k(col, segment_offsets, k, stream)) {
+    if (auto const static_bound = cub_batched_top_k_static_bound(col, segment_offsets, k, stream);
+        static_bound != 0) {
       return type_dispatcher<dispatch_storage_type>(
         col.type(),
-        dispatch_segmented_top_k_fn{col, segment_offsets, k, topk_order, true, stream, mr});
+        dispatch_segmented_top_k_fn{col, segment_offsets, k, topk_order, static_bound, stream, mr});
     }
     // Few segments that the batched path rejected (they are too large, or smaller than
     // k): select each one with a full-device cub::DeviceTopK call instead.
@@ -611,7 +642,7 @@ std::unique_ptr<column> segmented_top_k_order(column_view const& col,
               k <= avg_segment_size / cub_topk_loop_max_k_fraction) {
             return type_dispatcher<dispatch_storage_type>(
               col.type(),
-              dispatch_segmented_top_k_fn{col, segment_offsets, k, topk_order, false, stream, mr});
+              dispatch_segmented_top_k_fn{col, segment_offsets, k, topk_order, 0, stream, mr});
           }
         }
       }
