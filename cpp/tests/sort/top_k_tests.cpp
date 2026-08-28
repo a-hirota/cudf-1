@@ -544,9 +544,9 @@ TEST_F(TopK, TopKSegmentedFastPathRejectsSegmentSmallerThanK)
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected_order, result->view());
 }
 
-// Straddles the internal segment-size bound: 2048 rows is the largest segment the fast
-// path accepts (the most CUB compiles for) and 2049 forces the fallback. Both must give
-// the same answer, so this stays correct if the bound is later raised.
+// Straddles the baseline/cluster bound: 2048 rows uses CUB's narrow baseline bound.
+// With the cluster backend 2049 uses the wide bound; without it 2049 falls back. Both
+// must give the same answer.
 TEST_F(TopK, TopKSegmentedFastPathSegmentSizeBound)
 {
   using LCW  = cudf::test::lists_column_wrapper<int32_t>;
@@ -607,9 +607,9 @@ TEST_F(TopK, TopKSegmentedFastPathTies)
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected, result->view());
 }
 
-// A handful of partitions too large for the batched fast path (over 2048 rows) selects
-// with one full-device cub::DeviceTopK call per segment instead of sorting every segment.
-// This is the TPC-DS Q67 shape: few huge partitions.
+// These 20,000-row partitions are beyond the baseline bound but within the measured
+// cluster-preferred range. Without cluster support, one full-device cub::DeviceTopK
+// call per segment avoids sorting every segment. This is the TPC-DS Q67 shape.
 TEST_F(TopK, TopKSegmentedFewLargePartitions)
 {
   using LCW  = cudf::test::lists_column_wrapper<int32_t>;
@@ -654,8 +654,8 @@ TEST_F(TopK, TopKSegmentedFewLargePartitionsRagged)
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected_order, result->view());
 }
 
-// Uncovered rows before and after the covered range stay excluded on the per-segment
-// path, exactly as on the sort-based path.
+// Uncovered rows before and after the covered range stay excluded on every fast path,
+// exactly as on the sort-based path.
 TEST_F(TopK, TopKSegmentedFewLargePartitionsUncovered)
 {
   using LCW  = cudf::test::lists_column_wrapper<int32_t>;
@@ -675,9 +675,9 @@ TEST_F(TopK, TopKSegmentedFewLargePartitionsUncovered)
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected_order, result->view());
 }
 
-// Straddles the per-segment path's segment-count bound (64): 64 large segments use the
-// per-segment path, 65 fall back to the sort. Both must give the same answer, keeping
-// this correct if the bound is tuned later.
+// Without the cluster backend this straddles the per-segment path's count bound: 64
+// segments use that path and 65 fall back to the sort. With cluster support these
+// 20,000-row segments are inside the measured batched range. Every route must agree.
 TEST_F(TopK, TopKSegmentedFewLargePartitionsSegmentCountBound)
 {
   auto itr = cuda::counting_iterator<int32_t>{0};
@@ -737,8 +737,9 @@ TEST_F(TopK, TopKSegmentedFloatNaNFallsBack)
 }
 
 // NaN-free floating-point data takes the fast paths and must match the sort path's
-// values exactly (the typed TopKSegmentedFastPath case covers f32/f64 batched; this
-// covers the per-segment path with doubles at Q67-like sizes).
+// values exactly (the typed TopKSegmentedFastPath case covers small f32/f64 segments;
+// this covers the large-segment cluster or per-segment path with doubles at Q67-like
+// sizes).
 TEST_F(TopK, TopKSegmentedFloatFewLargePartitions)
 {
   using LCW = cudf::test::lists_column_wrapper<double>;
