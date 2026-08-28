@@ -43,6 +43,7 @@
 #include <thrust/transform.h>
 #include <thrust/transform_reduce.h>
 
+#include <algorithm>
 #include <vector>
 
 namespace cudf {
@@ -436,8 +437,8 @@ std::unique_ptr<column> cub_per_segment_top_k_order(column_view const& col,
 
   auto const temp_mr = cudf::get_current_device_resource_ref();
   auto indices       = rmm::device_uvector<size_type>(total, stream, temp_mr);
-  auto const in = col.begin<T>();
-  auto keys_out = cuda::make_discard_iterator();
+  auto const in      = col.begin<T>();
+  auto keys_out      = cuda::make_discard_iterator();
 
   auto requirements = cuda::execution::require(cuda::execution::determinism::not_guaranteed,
                                                cuda::execution::output_ordering::unsorted);
@@ -470,7 +471,7 @@ std::unique_ptr<column> cub_per_segment_top_k_order(column_view const& col,
     if (size <= 0) { continue; }
     if (size <= k) {
       // The whole segment is selected; its row indices need no CUB call.
-      thrust::sequence(rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
+      thrust::sequence(rmm::exec_policy_nosync(stream, temp_mr),
                        indices.begin() + h_out_offsets[i],
                        indices.begin() + h_out_offsets[i + 1],
                        h_offsets[i]);
@@ -489,7 +490,7 @@ std::unique_ptr<column> cub_per_segment_top_k_order(column_view const& col,
     std::move(offsets), std::move(child), col, topk_order, num_segments, stream, mr);
 }
 
-struct dispatch_segmented_topk_fn {
+struct dispatch_segmented_top_k_fn {
   column_view col;
   column_view segment_offsets;
   size_type k;
@@ -530,26 +531,29 @@ struct dispatch_segmented_topk_fn {
  * compile-time size bound, and needs no segment to be smaller than k, since it emits
  * exactly k indices per segment while the sort path emits min(k, segment_size).
  */
-bool can_use_cub_batched_topk(column_view const& col,
-                              column_view const& segment_offsets,
-                              size_type k,
-                              rmm::cuda_stream_view stream)
+bool can_use_cub_batched_top_k(column_view const& col,
+                               column_view const& segment_offsets,
+                               size_type k,
+                               rmm::cuda_stream_view stream)
 {
-  if (!is_fast_path(col, stream)) { return false; }
-
   auto const num_segments = segment_offsets.size() - 1;
   if (num_segments <= 0) { return false; }
 
   // Reduce straight to the answer in a single pass: the sizes themselves are not needed,
-  // only whether every segment is within [k, the largest this device's backends take].
+  // only whether the offsets are valid and every segment is within [k, the largest this
+  // device's backends take]. The caller has already checked the column type and nulls.
   auto const max_size  = cub_max_segment_size_for_device();
+  auto const col_size  = col.size();
   auto const d_offsets = segment_offsets.begin<size_type>();
   return thrust::transform_reduce(
     rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
     thrust::counting_iterator<size_type>(0),
     thrust::counting_iterator<size_type>(num_segments),
-    [d_offsets, k, max_size] __device__(size_type i) -> bool {
-      auto const size = d_offsets[i + 1] - d_offsets[i];
+    [d_offsets, k, max_size, col_size] __device__(size_type i) -> bool {
+      auto const begin = d_offsets[i];
+      auto const end   = d_offsets[i + 1];
+      if (begin < 0 || end < begin || end > col_size) { return false; }
+      auto const size = end - begin;
       return size >= k && size <= max_size;
     },
     true,
@@ -581,25 +585,35 @@ std::unique_ptr<column> segmented_top_k_order(column_view const& col,
                std::invalid_argument);
 
   if (is_fast_path(col, stream)) {
-    if (can_use_cub_batched_topk(col, segment_offsets, k, stream)) {
+    if (can_use_cub_batched_top_k(col, segment_offsets, k, stream)) {
       return type_dispatcher<dispatch_storage_type>(
         col.type(),
-        dispatch_segmented_topk_fn{col, segment_offsets, k, topk_order, true, stream, mr});
+        dispatch_segmented_top_k_fn{col, segment_offsets, k, topk_order, true, stream, mr});
     }
     // Few segments that the batched path rejected (they are too large, or smaller than
     // k): select each one with a full-device cub::DeviceTopK call instead.
     if (auto const num_segments = segment_offsets.size() - 1;
         num_segments > 0 && num_segments <= cub_topk_loop_max_segments) {
-      auto const bounds = cudf::detail::make_host_vector(
-        device_span<size_type const>{segment_offsets.begin<size_type>(),
-                                     static_cast<std::size_t>(num_segments) + 1},
-        stream);
-      auto const avg_segment_size = (bounds.back() - bounds.front()) / num_segments;
-      if (avg_segment_size >= cub_topk_loop_min_avg_segment_size &&
-          k <= avg_segment_size / cub_topk_loop_max_k_fraction) {
-        return type_dispatcher<dispatch_storage_type>(
-          col.type(),
-          dispatch_segmented_topk_fn{col, segment_offsets, k, topk_order, false, stream, mr});
+      // The covered average cannot exceed this value for valid offsets. Reject cheap
+      // cases before synchronizing a full offsets copy to the host.
+      auto const max_possible_avg = col.size() / num_segments;
+      if (max_possible_avg >= cub_topk_loop_min_avg_segment_size &&
+          k <= max_possible_avg / cub_topk_loop_max_k_fraction) {
+        auto const bounds = cudf::detail::make_host_vector(
+          device_span<size_type const>{segment_offsets.begin<size_type>(),
+                                       static_cast<std::size_t>(num_segments) + 1},
+          stream);
+        auto const valid_offsets = bounds.front() >= 0 && bounds.back() <= col.size() &&
+                                   std::is_sorted(bounds.begin(), bounds.end());
+        if (valid_offsets) {
+          auto const avg_segment_size = (bounds.back() - bounds.front()) / num_segments;
+          if (avg_segment_size >= cub_topk_loop_min_avg_segment_size &&
+              k <= avg_segment_size / cub_topk_loop_max_k_fraction) {
+            return type_dispatcher<dispatch_storage_type>(
+              col.type(),
+              dispatch_segmented_top_k_fn{col, segment_offsets, k, topk_order, false, stream, mr});
+          }
+        }
       }
     }
   }
