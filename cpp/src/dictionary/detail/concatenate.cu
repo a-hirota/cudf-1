@@ -11,8 +11,8 @@
 #include <cudf/detail/iterator.cuh>
 #include <cudf/detail/row_operator/equality.cuh>
 #include <cudf/detail/row_operator/hashing.cuh>
-#include <cudf/detail/utilities/vector_factories.hpp>
 #include <cudf/detail/unary.hpp>
+#include <cudf/detail/utilities/vector_factories.hpp>
 #include <cudf/dictionary/detail/concatenate.hpp>
 #include <cudf/dictionary/detail/encode.hpp>
 #include <cudf/dictionary/dictionary_column_view.hpp>
@@ -20,10 +20,10 @@
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/utilities/error.hpp>
-#include <cudf/utilities/traits.hpp>
-#include <cudf/utilities/type_dispatcher.hpp>
 #include <cudf/utilities/memory_resource.hpp>
+#include <cudf/utilities/traits.hpp>
 #include <cudf/utilities/type_checks.hpp>
+#include <cudf/utilities/type_dispatcher.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_uvector.hpp>
@@ -275,9 +275,10 @@ std::unique_ptr<column> concatenate(host_span<column_view const> columns,
   // concatenated keys no longer fit in it (e.g. two INT8 dictionaries with 200 distinct keys).
   auto indices_type = std::accumulate(
     columns.begin(), columns.end(), data_type{type_id::INT8}, [](data_type widest, auto cv) {
-      auto dict_view = dictionary_column_view(cv);
-      if (dict_view.is_empty()) { return widest; }
-      auto const t = dict_view.indices().type();
+      // an empty dictionary column may carry no children at all, but a sliced-to-empty
+      // view still has an indices child whose type participates in the selection
+      if (cv.num_children() == 0) { return widest; }
+      auto const t = dictionary_column_view(cv).indices().type();
       return cudf::size_of(t) > cudf::size_of(widest) ? t : widest;
     });
   auto const needed_type = get_indices_type_for_size(keys_column->size());
@@ -291,7 +292,8 @@ std::unique_ptr<column> concatenate(host_span<column_view const> columns,
       if (dict_view.is_empty()) { return column_view{indices_type, 0, nullptr, nullptr, 0}; }
       auto indices = dict_view.get_indices_annotated();  // includes validity mask and view offset
       if (indices.type() == indices_type) { return indices; }
-      widened_indices.emplace_back(cudf::detail::cast(indices, indices_type, stream, cudf::get_current_device_resource_ref()));
+      widened_indices.emplace_back(
+        cudf::detail::cast(indices, indices_type, stream, cudf::get_current_device_resource_ref()));
       return widened_indices.back()->view();
     });
   auto all_indices = cudf::detail::concatenate(indices_views, stream, mr);
