@@ -96,6 +96,8 @@ class parquet_reader_options {
 
   // Whether to store string data as categorical type
   bool _convert_strings_to_categories = false;
+  // Whether to return eligible flat columns as DICTIONARY32 encoded columns
+  bool _output_dict_columns = false;
   // Whether to use PANDAS metadata to load columns
   bool _use_pandas_metadata = true;
   // Whether to read and use ARROW schema
@@ -163,6 +165,27 @@ class parquet_reader_options {
   {
     return _convert_strings_to_categories;
   }
+
+  /**
+   * @brief Returns whether the reader returns flat string and fixed-width columns as DICTIONARY32
+   * encoded columns
+   *
+   * When true, the reader outputs eligible flat columns as DICTIONARY32 encoded columns: a signed
+   * integer indices child (INT8/INT16/INT32, sized to the largest row-group dictionary with the
+   * same width rule as cudf::dictionary::encode) plus a keys child of the column's logical type.
+   * Eligible are flat STRING columns and flat fixed-width columns whose physical storage is INT32
+   * or INT64 and whose decode is a plain copy (no decimal, timestamp-unit, or width conversion),
+   * when every data page of the column is dictionary encoded.
+   *
+   * When AST/JIT filters are set, the direct transcode fast path is disabled.
+   * String columns are materialized, then operated on by the filter, and the filtered results are
+   * encoded as DICTIONARY32 columns. Fixed-width columns participate only in the direct fast path
+   * and are returned as plain columns whenever it does not apply (filters, chunked or bounded
+   * reads, or pages that are not dictionary encoded).
+   *
+   * @return `true` if the reader returns eligible flat columns as DICTIONARY32 encoded columns
+   */
+  [[nodiscard]] bool is_enabled_output_dict_columns() const { return _output_dict_columns; }
 
   /**
    * @brief Returns boolean depending on whether to use pandas metadata while reading.
@@ -510,6 +533,15 @@ class parquet_reader_options {
   void enable_convert_strings_to_categories(bool val) { _convert_strings_to_categories = val; }
 
   /**
+   * @brief Sets to enable/disable trying to output DICTIONARY32 columns for eligible flat string
+   * and fixed-width columns (see is_enabled_output_dict_columns for eligibility and fallback
+   * behavior).
+   *
+   * @param val Boolean indicating whether to output eligible flat columns as DICTIONARY32
+   */
+  void enable_output_dict_columns(bool val) { _output_dict_columns = val; }
+
+  /**
    * @brief Sets to enable/disable use of pandas metadata to read.
    *
    * @param val Boolean indicating whether to use pandas metadata
@@ -737,6 +769,27 @@ class parquet_reader_options_builder {
   parquet_reader_options_builder& convert_strings_to_categories(bool val)
   {
     options.enable_convert_strings_to_categories(val);
+    return *this;
+  }
+
+  /**
+   * @brief Sets options for enabling/disabling output of DICTIONARY32 columns for eligible flat
+   * string and fixed-width columns.
+   *
+   * @param val Boolean value whether to output eligible flat columns as DICTIONARY32 encoded
+   * columns
+   *
+   * @note When enabled, eligible columns are returned as DICTIONARY32 with a signed integer
+   * indices child sized to the dictionary and a keys child of the logical type; string columns
+   * are always delivered as DICTIONARY32 (post-read encoded when the direct path does not apply),
+   * while fixed-width columns fall back to their plain type
+   * (see parquet_reader_options::is_enabled_output_dict_columns).
+   *
+   * @return this for chaining
+   */
+  parquet_reader_options_builder& output_dict_columns(bool val)
+  {
+    options.enable_output_dict_columns(val);
     return *this;
   }
 

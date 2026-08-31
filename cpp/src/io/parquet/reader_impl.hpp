@@ -225,6 +225,27 @@ class reader_impl {
     parquet_reader_options const& options) const;
 
   /**
+   * @brief Detect columns eligible for direct Parquet-dict -> DICTIONARY32 transcode and retype
+   * their output buffers to the sized index type.
+   *
+   * Must be called after page headers are decoded and before output buffers are allocated.
+   * Populates `_dict_transcode_eligible` (the sole signal of whether the fast path is active;
+   * `assemble_dict_transcoded_columns` no-ops when no column is eligible) and
+   * `_dict_transcode_key_types`.
+   *
+   * @param mode Value indicating if the data sources are read all at once or chunk by chunk
+   */
+  void prepare_dict_transcode(read_mode mode);
+
+  /**
+   * @brief Assemble DICTIONARY32 output columns for input columns that were marked eligible by
+   * `prepare_dict_transcode`.
+   *
+   * @param out_columns The output columns vector to transcode in place.
+   */
+  void assemble_dict_transcoded_columns(std::vector<std::unique_ptr<column>>& out_columns);
+
+  /**
    * @brief Read compressed data and page information for the current pass.
    */
   void read_compressed_data();
@@ -531,6 +552,8 @@ class reader_impl {
     bool prepend_source_index_column = false;
     // Whether to prepend the file-local row index column to the output
     bool prepend_row_index_column = false;
+    // Whether to try outputting DICTIONARY32 columns for fully dict-encoded columns
+    bool output_dict_columns = false;
   } _options;
 
   // name to reference converter to extract AST output filter
@@ -567,6 +590,13 @@ class reader_impl {
   std::size_t _num_filter_only_columns{0};
 
   bool _strings_to_categorical = false;
+
+  // Per-input-column flag indicating whether that column was selected for direct
+  // Parquet-dict -> DICTIONARY32 transcode.
+  std::vector<bool> _dict_transcode_eligible;
+  // Per input column: the logical output type of a column selected for direct transcode
+  // (the DICTIONARY32 keys type); EMPTY when the column is not transcoded.
+  std::vector<data_type> _dict_transcode_key_types;
 
   // are there usable page indexes available
   bool _has_page_index = false;
