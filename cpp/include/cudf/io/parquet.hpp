@@ -51,6 +51,22 @@ constexpr size_type default_max_page_fragment_size     = 5000;  ///< 5000 rows p
  */
 [[nodiscard]] bool is_supported_read_parquet(compression_type compression);
 
+namespace detail {
+/**
+ * @brief Overlay-only backing store for `parquet_reader_options` `output_dict_columns`.
+ *
+ * Upstream (>= 26.10) stores the flag as a `parquet_reader_options` member. The Theseus
+ * 26.08 overlay must keep the public layout of `parquet_reader_options` byte-identical to
+ * stock 26.08: binaries compiled against the stock header (e.g. pylibcudf) construct the
+ * options object with their own layout, so inserting a member would make the overlay read
+ * another field's bytes. The flag therefore lives in the library as a process-wide switch
+ * and the member functions below delegate to it.
+ */
+void set_parquet_output_dict_columns(bool enabled);
+/// @copydoc set_parquet_output_dict_columns
+[[nodiscard]] bool parquet_output_dict_columns_enabled();
+}  // namespace detail
+
 /**
  * @brief Check if the compression type is supported for writing Parquet files.
  *
@@ -96,8 +112,6 @@ class parquet_reader_options {
 
   // Whether to store string data as categorical type
   bool _convert_strings_to_categories = false;
-  // Whether to return eligible flat columns as DICTIONARY32 encoded columns
-  bool _output_dict_columns = false;
   // Whether to use PANDAS metadata to load columns
   bool _use_pandas_metadata = true;
   // Whether to read and use ARROW schema
@@ -185,7 +199,10 @@ class parquet_reader_options {
    *
    * @return `true` if the reader returns eligible flat columns as DICTIONARY32 encoded columns
    */
-  [[nodiscard]] bool is_enabled_output_dict_columns() const { return _output_dict_columns; }
+  [[nodiscard]] bool is_enabled_output_dict_columns() const
+  {
+    return detail::parquet_output_dict_columns_enabled();
+  }
 
   /**
    * @brief Returns boolean depending on whether to use pandas metadata while reading.
@@ -537,9 +554,13 @@ class parquet_reader_options {
    * and fixed-width columns (see is_enabled_output_dict_columns for eligibility and fallback
    * behavior).
    *
+   * @note In this 26.08 overlay the flag is process-wide (see detail::
+   * set_parquet_output_dict_columns), not per-options: the last value set applies to every
+   * subsequent parquet read in the process.
+   *
    * @param val Boolean indicating whether to output eligible flat columns as DICTIONARY32
    */
-  void enable_output_dict_columns(bool val) { _output_dict_columns = val; }
+  void enable_output_dict_columns(bool val) { detail::set_parquet_output_dict_columns(val); }
 
   /**
    * @brief Sets to enable/disable use of pandas metadata to read.

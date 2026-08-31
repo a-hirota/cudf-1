@@ -27,6 +27,7 @@
 #include <cuda/iterator>
 
 #include <algorithm>
+#include <atomic>
 #include <functional>
 #include <iterator>
 #include <numeric>
@@ -506,3 +507,19 @@ void reader_impl::assemble_dict_transcoded_columns(
 }
 
 }  // namespace cudf::io::parquet::detail
+
+namespace cudf::io::detail {
+namespace {
+std::atomic<bool> parquet_output_dict_columns_flag{false};
+}  // namespace
+
+void set_parquet_output_dict_columns(bool enabled)
+{
+  parquet_output_dict_columns_flag.store(enabled, std::memory_order_relaxed);
+}
+
+bool parquet_output_dict_columns_enabled()
+{
+  return parquet_output_dict_columns_flag.load(std::memory_order_relaxed);
+}
+}  // namespace cudf::io::detail

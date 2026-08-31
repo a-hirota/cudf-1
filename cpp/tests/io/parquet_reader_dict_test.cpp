@@ -169,7 +169,22 @@ void write_parquet_adaptive(cudf::table_view const& input,
 
 }  // namespace
 
-struct ParquetReaderDictTest : public cudf::test::BaseFixture {};
+// In the 26.08 overlay `output_dict_columns` is a process-wide flag (the public options
+// layout cannot change without breaking binaries compiled against stock headers), so reset
+// it around every test to keep tests order-independent and to avoid leaking the setting
+// into the other suites of this binary.
+struct ParquetReaderDictTest : public cudf::test::BaseFixture {
+  void SetUp() override
+  {
+    cudf::test::BaseFixture::SetUp();
+    cudf::io::detail::set_parquet_output_dict_columns(false);
+  }
+  void TearDown() override
+  {
+    cudf::io::detail::set_parquet_output_dict_columns(false);
+    cudf::test::BaseFixture::TearDown();
+  }
+};
 
 // A flat string column that is fully dictionary-encoded in every row group should be returned
 // as a DICTIONARY32 column when `output_dict_columns` is enabled, and the decoded keys
@@ -607,7 +622,9 @@ TEST_F(ParquetReaderDictTest, FixedWidthFilterFallsBackToPlain)
   auto const read_str = read_table->view().column(1);
   ASSERT_EQ(read_str.type().id(), cudf::type_id::DICTIONARY32);
 
-  // Cross-check the surviving rows against a plain filtered read.
+  // Cross-check the surviving rows against a plain filtered read. The overlay flag is
+  // process-wide, so drop it explicitly for the plain read.
+  cudf::io::detail::set_parquet_output_dict_columns(false);
   auto const plain_table = cudf::io::read_parquet(cudf::io::parquet_reader_options::builder(
                                                     cudf::io::source_info{filepath})
                                                     .filter(expr)
