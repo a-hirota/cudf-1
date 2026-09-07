@@ -23,6 +23,7 @@
 #include <cudf/utilities/type_dispatcher.hpp>
 
 #include <rmm/device_buffer.hpp>
+#include <rmm/device_uvector.hpp>
 
 #include <cuda/iterator>
 
@@ -228,6 +229,70 @@ void update_from_chunk(column_eligibility& e, ColumnChunkDesc const& chunk)
                                   rmm::device_buffer{dict_page_data, keys_bytes, stream, mr},
                                   rmm::device_buffer{},
                                   0);
+}
+
+/**
+ * @brief Build one keys column holding every chunk's dictionary entries back to back.
+ *
+ * The per-chunk alternative (`make_keys_column` once per chunk) costs a host synchronization per
+ * chunk for STRING columns, because `make_strings_column` has to read the total character count
+ * back before it can size the chars buffer. A reader that is handed a few hundred row groups pays
+ * that once per row-group chunk per eligible column, which dominates the transcode. Copying every
+ * chunk's dictionary payload into one buffer first turns that into a single synchronization per
+ * column; the caller slices the result back into per-chunk key views, which are views, not copies.
+ *
+ * @param chunks The pass chunk descriptors
+ * @param chunk_indices Indices into `chunks` of this column's chunks, in row-group order
+ * @param chunk_dict_data Per-chunk device pointer to the (decompressed) dictionary page payload
+ * @param chunk_key_counts Per-chunk dictionary entry count
+ * @param key_offsets Exclusive scan of `chunk_key_counts` with the total appended
+ * @param key_type The logical output type of the column
+ * @param stream CUDA stream used for device memory operations and kernel launches
+ * @param mr Device memory resource used to allocate the returned column's memory
+ * @return A `key_type` column of `key_offsets.back()` entries
+ */
+[[nodiscard]] std::unique_ptr<column> make_all_chunk_keys_column(
+  cudf::detail::hostdevice_vector<ColumnChunkDesc> const& chunks,
+  std::vector<size_t> const& chunk_indices,
+  std::vector<uint8_t const*> const& chunk_dict_data,
+  std::vector<size_type> const& chunk_key_counts,
+  std::vector<size_type> const& key_offsets,
+  data_type key_type,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr)
+{
+  auto const total_keys = key_offsets.back();
+  if (total_keys <= 0) { return cudf::make_empty_column(key_type); }
+
+  if (key_type.id() == type_id::STRING) {
+    rmm::device_uvector<string_index_pair> pairs(static_cast<std::size_t>(total_keys), stream);
+    for (std::size_t k = 0; k < chunk_indices.size(); ++k) {
+      if (chunk_key_counts[k] <= 0) { continue; }
+      auto const* src = chunks[chunk_indices[k]].str_dict_index;
+      CUDF_EXPECTS(src != nullptr, "Missing string dictionary index for a dict-transcoded chunk");
+      CUDF_CUDA_TRY(
+        cudaMemcpyAsync(pairs.data() + key_offsets[k],
+                        src,
+                        static_cast<std::size_t>(chunk_key_counts[k]) * sizeof(string_index_pair),
+                        cudaMemcpyDefault,
+                        stream.value()));
+    }
+    return cudf::strings::detail::make_strings_column(pairs.begin(), pairs.end(), stream, mr);
+  }
+
+  auto const key_width = cudf::size_of(key_type);
+  rmm::device_buffer keys_data(static_cast<std::size_t>(total_keys) * key_width, stream, mr);
+  for (std::size_t k = 0; k < chunk_indices.size(); ++k) {
+    if (chunk_key_counts[k] <= 0 or chunk_dict_data[k] == nullptr) { continue; }
+    CUDF_CUDA_TRY(cudaMemcpyAsync(static_cast<uint8_t*>(keys_data.data()) +
+                                    static_cast<std::size_t>(key_offsets[k]) * key_width,
+                                  chunk_dict_data[k],
+                                  static_cast<std::size_t>(chunk_key_counts[k]) * key_width,
+                                  cudaMemcpyDefault,
+                                  stream.value()));
+  }
+  return std::make_unique<column>(
+    key_type, total_keys, std::move(keys_data), rmm::device_buffer{}, 0);
 }
 
 }  // namespace
@@ -473,22 +538,33 @@ void reader_impl::assemble_dict_transcoded_columns(
       // plus the parent's offset/size/null_mask -- anything set on the child is ignored. A wrong
       // null count (e.g. a hardcoded 0) would silently turn nulls into a valid index once
       // `cudf::detail::concatenate` remaps the indices against the unified keys.
-      std::vector<std::unique_ptr<column>> seg_keys_owners(chunk_indices.size());
+      // One keys column for every chunk, sliced back into per-chunk key views. Building a keys
+      // column per chunk instead costs a host synchronization per chunk for STRING keys, which is
+      // the whole transcode cost once a read spans a few hundred row groups.
+      std::vector<size_type> key_offsets(chunk_indices.size() + 1, 0);
+      std::inclusive_scan(
+        chunk_key_counts.begin(), chunk_key_counts.end(), key_offsets.begin() + 1);
+      auto const all_keys = make_all_chunk_keys_column(pass.chunks,
+                                                       chunk_indices,
+                                                       chunk_dict_data,
+                                                       chunk_key_counts,
+                                                       key_offsets,
+                                                       key_type,
+                                                       _stream,
+                                                       get_current_device_resource_ref());
+      std::vector<size_type> key_slice_points;
+      key_slice_points.reserve(chunk_indices.size() * 2);
+      for (size_t k = 0; k < chunk_indices.size(); ++k) {
+        key_slice_points.push_back(key_offsets[k]);
+        key_slice_points.push_back(key_offsets[k + 1]);
+      }
+      auto const seg_keys_views = cudf::detail::slice(all_keys->view(), key_slice_points, _stream);
+
       std::vector<column_view> dict_segment_views(chunk_indices.size());
       std::transform(cuda::counting_iterator<size_t>{0},
                      cuda::counting_iterator{chunk_indices.size()},
                      dict_segment_views.begin(),
                      [&](size_t k) {
-                       auto const chunk_idx = chunk_indices[k];
-                       auto const& chunk    = pass.chunks[chunk_idx];
-
-                       seg_keys_owners[k] = make_keys_column(chunk,
-                                                             chunk_dict_data[k],
-                                                             key_type,
-                                                             chunk_key_counts[k],
-                                                             _stream,
-                                                             get_current_device_resource_ref());
-
                        auto const seg_begin = chunk_row_offsets[k];
                        auto const seg_end   = chunk_row_offsets[k + 1];
                        auto const seg_rows  = seg_end - seg_begin;
@@ -498,7 +574,7 @@ void reader_impl::assemble_dict_transcoded_columns(
                                           indices_view.null_mask(),  // shared with indices_view
                                           seg_null_counts[k],
                                           seg_begin,  // reslices shared indices child + null mask
-                                          {indices_view, seg_keys_owners[k]->view()}};
+                                          {indices_view, seg_keys_views[k]}};
                      });
 
       // `cudf::detail::concatenate` deduplicates + sorts keys and recomputes indices.
