@@ -17,6 +17,7 @@
 #include <cudf/dictionary/dictionary_column_view.hpp>
 #include <cudf/dictionary/encode.hpp>
 #include <cudf/io/parquet.hpp>
+#include <cudf/reduction/distinct_count.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/table/table_view.hpp>
@@ -57,9 +58,9 @@ std::string make_value_string(int value)
   return std::string{utf8_prefixes[value % utf8_prefixes.size()]} + "_" + std::to_string(value);
 }
 
-cudf::test::strings_column_wrapper make_low_cardinality_strings()
+cudf::test::strings_column_wrapper make_low_cardinality_strings(unsigned int col_seed = seed)
 {
-  std::mt19937 engine(seed);
+  std::mt19937 engine(col_seed);
   std::uniform_int_distribution<int> value_dist(0, cardinality - 1);
   std::bernoulli_distribution null_dist(null_probability);
 
@@ -165,6 +166,24 @@ void write_parquet_adaptive(cudf::table_view const& input,
       .max_page_fragment_size(row_group_size)
       .build();
   cudf::io::write_parquet(options);
+}
+
+// Build a  flat, low-cardinality string column in which one entire row group is all-null while
+// every other row group is normal low-cardinality data. The column is returned as a DICTIONARY32
+// column when `output_dict_columns` is enabled.
+cudf::test::strings_column_wrapper make_strings_with_null_row_group()
+{
+  std::mt19937 engine(seed);
+  std::uniform_int_distribution<int> value_dist(0, cardinality - 1);
+
+  auto const null_row_group = 2;  // every row in this row group is null
+  std::vector<std::string> strings(num_rows);
+  std::vector<bool> valids(num_rows);
+  for (cudf::size_type i = 0; i < num_rows; ++i) {
+    strings[i] = make_value_string(value_dist(engine));
+    valids[i]  = (i / row_group_size) != null_row_group;
+  }
+  return cudf::test::strings_column_wrapper(strings.begin(), strings.end(), valids.begin());
 }
 
 }  // namespace
@@ -547,6 +566,101 @@ cudf::test::fixed_width_column_wrapper<cudf::timestamp_D, int32_t> make_low_card
 
 }  // namespace
 
+// Test to check if keys across multiple row groups are unique.
+TEST_F(ParquetReaderDictTest, MultiRowGroupKeysAreUnique)
+{
+  auto input_col = make_low_cardinality_strings();
+
+  auto const input_tbl = cudf::table_view{{input_col}};
+  auto const filepath  = temp_env->get_temp_filepath("MultiRowGroupKeysAreUnique.parquet");
+  write_parquet(input_tbl, filepath);
+
+  auto const read_table = read_parquet_as_dict(filepath).tbl;
+  ASSERT_EQ(read_table->num_columns(), 1);
+  auto const read_col = read_table->view().column(0);
+  ASSERT_EQ(read_col.type().id(), cudf::type_id::DICTIONARY32);
+
+  cudf::dictionary_column_view const dict_view(read_col);
+  auto const keys = dict_view.keys();
+
+  // Keys must be unique and no larger than the source cardinality; a stacked-but-not-deduplicated
+  // dictionary would carry up to (number of row groups) times more keys.
+  auto const num_distinct =
+    cudf::distinct_count(keys, cudf::null_policy::INCLUDE, cudf::nan_policy::NAN_IS_VALID);
+  EXPECT_EQ(num_distinct, keys.size());
+  EXPECT_LE(keys.size(), cardinality);
+
+  // Check if the decoded column is equal to the original input.
+  auto const decoded = cudf::dictionary::decode(dict_view);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(input_col, decoded->view());
+}
+
+// Test to check if keys across multiple string columns are unique.
+TEST_F(ParquetReaderDictTest, MultiStringColumnsDictTranscode)
+{
+  auto col_a = make_low_cardinality_strings();  // default seed
+  auto col_b = make_low_cardinality_strings(seed ^ 0xBE'EF01u);
+
+  auto const input_tbl = cudf::table_view{{col_a, col_b}};
+  auto const filepath  = temp_env->get_temp_filepath("MultiStringColumnsDictTranscode.parquet");
+  write_parquet(input_tbl, filepath);  // row_group_size rows/group -> multiple row groups
+
+  auto const read_table = read_parquet_as_dict(filepath).tbl;
+  ASSERT_EQ(read_table->num_rows(), num_rows);
+  ASSERT_EQ(read_table->num_columns(), 2);
+
+  auto const read_a = read_table->view().column(0);
+  auto const read_b = read_table->view().column(1);
+  ASSERT_EQ(read_a.type().id(), cudf::type_id::DICTIONARY32);
+  ASSERT_EQ(read_b.type().id(), cudf::type_id::DICTIONARY32);
+
+  // Keys must be deduplicated in both columns -- the strided multi-column branch must produce
+  // unique keys (no larger than the cardinality) just like the contiguous single-column path.
+  for (auto const& read_col : {read_a, read_b}) {
+    auto const keys = cudf::dictionary_column_view(read_col).keys();
+    auto const num_distinct =
+      cudf::distinct_count(keys, cudf::null_policy::INCLUDE, cudf::nan_policy::NAN_IS_VALID);
+    EXPECT_EQ(num_distinct, keys.size());
+    EXPECT_LE(keys.size(), cardinality);
+  }
+
+  auto const decoded_a = cudf::dictionary::decode(cudf::dictionary_column_view(read_a));
+  auto const decoded_b = cudf::dictionary::decode(cudf::dictionary_column_view(read_b));
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(col_a, decoded_a->view());
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(col_b, decoded_b->view());
+}
+
+// An otherwise-eligible flat string column with one entirely-null row group. That row group has no
+// dictionary entries, so its chunk contributes rows but zero keys.The reader must return a
+// DICTIONARY32 column with deduplicated keys that decodes back to the original input.
+TEST_F(ParquetReaderDictTest, NullRowGroupDictTranscode)
+{
+  auto input_col = make_strings_with_null_row_group();
+
+  auto const input_tbl = cudf::table_view{{input_col}};
+  auto const filepath  = temp_env->get_temp_filepath("NullRowGroupDictTranscode.parquet");
+  write_parquet(input_tbl, filepath);  // row_group_size rows/group -> one group is fully null
+
+  auto const read_table = read_parquet_as_dict(filepath).tbl;
+  ASSERT_EQ(read_table->num_rows(), num_rows);
+  ASSERT_EQ(read_table->num_columns(), 1);
+
+  auto const read_col = read_table->view().column(0);
+  ASSERT_EQ(read_col.type().id(), cudf::type_id::DICTIONARY32);
+
+  cudf::dictionary_column_view const dict_view(read_col);
+  auto const keys = dict_view.keys();
+
+  // The all-null row group adds no keys; keys stay deduplicated across the surviving row groups.
+  auto const num_distinct =
+    cudf::distinct_count(keys, cudf::null_policy::INCLUDE, cudf::nan_policy::NAN_IS_VALID);
+  EXPECT_EQ(num_distinct, keys.size());
+  EXPECT_LE(keys.size(), cardinality);
+
+  auto const decoded = cudf::dictionary::decode(dict_view);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(input_col, decoded->view());
+}
+
 // Flat fixed-width columns (INT32 with nulls, INT64, DATE) written with dictionary encoding must
 // transcode to DICTIONARY32 columns whose keys carry the logical type, across several row groups,
 // and decode back to exactly the input.
@@ -755,4 +869,44 @@ TEST_F(ParquetReaderDictTest, FixedWidthChunkedReadFallsBackToPlain)
   EXPECT_GT(num_chunks, 1) << "byte limit should split the read into multiple chunks";
   auto const combined = cudf::concatenate(views);
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(col, combined->view());
+}
+
+// Row-group dictionaries fit INT8 separately, but their union needs INT16. Exercise both
+// fixed-width keys and the optimized string-key gather while preserving null rows.
+TEST_F(ParquetReaderDictTest, DictTranscodeWidensMergedIndices)
+{
+  std::vector<int32_t> values(num_rows);
+  std::vector<std::string> strings(num_rows);
+  std::vector<bool> valid(num_rows);
+  for (cudf::size_type row = 0; row < num_rows; ++row) {
+    values[row]  = (row / row_group_size) * 100 + row % 100;
+    strings[row] = make_value_string(values[row]);
+    valid[row]   = row % 17 != 0;
+  }
+  auto ints =
+    cudf::test::fixed_width_column_wrapper<int32_t>(values.begin(), values.end(), valid.begin());
+  auto strs = cudf::test::strings_column_wrapper(strings.begin(), strings.end(), valid.begin());
+  auto const input    = cudf::table_view{{ints, strs}};
+  auto const filepath = temp_env->get_temp_filepath("DictTranscodeWidensMergedIndices.parquet");
+  write_parquet(input, filepath);
+
+  // Reading just one row group proves the per-chunk indices use INT8.
+  auto const single = cudf::io::read_parquet(
+                        cudf::io::parquet_reader_options::builder(cudf::io::source_info{filepath})
+                          .row_groups({{0}})
+                          .output_dict_columns(true)
+                          .build())
+                        .tbl;
+  auto const merged = read_parquet_as_dict(filepath).tbl;
+  for (cudf::size_type col = 0; col < input.num_columns(); ++col) {
+    ASSERT_EQ(single->view().column(col).type().id(), cudf::type_id::DICTIONARY32);
+    EXPECT_EQ(cudf::dictionary_column_view(single->view().column(col)).indices().type().id(),
+              cudf::type_id::INT8);
+    ASSERT_EQ(merged->view().column(col).type().id(), cudf::type_id::DICTIONARY32);
+    auto const dict = cudf::dictionary_column_view(merged->view().column(col));
+    EXPECT_EQ(dict.indices().type().id(), cudf::type_id::INT16);
+    EXPECT_EQ(dict.keys().size(), 500);
+    auto const decoded = cudf::dictionary::decode(dict);
+    CUDF_TEST_EXPECT_COLUMNS_EQUAL(input.column(col), decoded->view());
+  }
 }
